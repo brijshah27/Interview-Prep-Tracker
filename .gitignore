@@ -1,0 +1,10 @@
+.DS_Store
+
+# The workbook is the user's local database. Do not publish interview progress.
+L5_Tracker.xlsx
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.tmp

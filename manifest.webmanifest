@@ -1,0 +1,18 @@
+{
+  "name": "Google L5 Preparation Tracker",
+  "short_name": "L5 Tracker",
+  "description": "A local-first Google L5 interview preparation tracker backed by Excel.",
+  "start_url": "./L5_Dashboard.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F3F5F8",
+  "theme_color": "#26375E",
+  "icons": [
+    {
+      "src": "./icons/tracker-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

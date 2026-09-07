@@ -3,7 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#26375E">
+<meta name="application-name" content="L5 Preparation">
 <title>Google L5 preparation tracker</title>
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./icons/tracker-icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="./icons/tracker-icon.svg">
 <style>
 :root{
   --paper:#F3F5F8; --panel:#fff; --ink:#161B24; --ink2:#5A6478; --ink3:#8A93A6;
@@ -232,10 +237,10 @@ dialog::backdrop{background:rgba(20,25,35,.4)}
 
 <div class="filebar">
   <div class="wrap">
-    <button class="fbtn primary" id="btnOpen">Open workbook</button>
-    <button class="fbtn" id="btnSave">Save</button>
-    <button class="fbtn" id="btnDownload">Download workbook</button>
-    <button class="fbtn" id="btnReload">Reload from file</button>
+    <button class="fbtn primary" id="btnOpen">Connect workbook</button>
+    <button class="fbtn" id="btnSave">Save now</button>
+    <button class="fbtn" id="btnDownload">Download backup</button>
+    <button class="fbtn" id="btnReload">Sync now</button>
     <span id="fileState"></span>
     <p id="fsNote"></p>
   </div>
@@ -588,13 +593,46 @@ const FILE = PLAN.meta.file;
 let S = emptyState(PLAN);
 let tab = 'today';
 let openWeek = null;
-let handle = null;          // FileSystemFileHandle when the browser supports it
+let handle = null;          // Persisted FileSystemFileHandle for the local workbook
 let dirty = false;
 let lastSaved = null;
 let saveTimer = null;
+let syncTimer = null;
+let lastObservedModified = null;
+let saveInProgress = false;
 const canFS = typeof window.showOpenFilePicker === 'function';
+const HANDLE_DB = 'l5-preparation-tracker';
+const HANDLE_STORE = 'workbook';
+const HANDLE_KEY = 'active-workbook';
+const SYNC_INTERVAL_MS = 5000;
 
 /* ------------------------------------------------------------ file layer */
+function openHandleStore() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(HANDLE_DB, 1);
+    request.onupgradeneeded = () => request.result.createObjectStore(HANDLE_STORE);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+async function savedHandle() {
+  if (!canFS || typeof indexedDB === 'undefined') return null;
+  const db = await openHandleStore();
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(HANDLE_STORE, 'readonly').objectStore(HANDLE_STORE).get(HANDLE_KEY);
+    request.onsuccess = () => { db.close(); resolve(request.result || null); };
+    request.onerror = () => { db.close(); reject(request.error); };
+  });
+}
+async function rememberHandle(h) {
+  if (!canFS || typeof indexedDB === 'undefined') return;
+  const db = await openHandleStore();
+  await new Promise((resolve, reject) => {
+    const request = db.transaction(HANDLE_STORE, 'readwrite').objectStore(HANDLE_STORE).put(h, HANDLE_KEY);
+    request.onsuccess = () => { db.close(); resolve(); };
+    request.onerror = () => { db.close(); reject(request.error); };
+  });
+}
 function setStatus(text, kind) {
   const n = $('#fileState');
   n.textContent = text;
@@ -612,21 +650,28 @@ function markDirty() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveToHandle, 1200);
 }
-async function saveToHandle() {
-  if (!handle) return;
+async function saveToHandle(skipExternalSync) {
+  if (!handle || saveInProgress) return;
+  /* Check just before writing: the user chose Excel as the conflict winner. */
+  if (!skipExternalSync && await syncFromHandle()) return;
+  saveInProgress = true;
   try {
     const buf = XLSX.write(buildWorkbook(XLSX, PLAN, S), { type: 'array', bookType: 'xlsx' });
     const w = await handle.createWritable();
     await w.write(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
     await w.close();
+    lastObservedModified = (await handle.getFile()).lastModified;
     dirty = false;
     lastSaved = new Date().toLocaleTimeString();
     setStatus(describeConnection(), 'ok');
   } catch (e) {
-    setStatus('Save failed: ' + e.message + '. Use Download workbook instead.', 'warn');
+    setStatus('Save failed: ' + e.message + '. Check whether Excel has the workbook open.', 'warn');
+  } finally {
+    saveInProgress = false;
   }
 }
-function applyRead(r, from) {
+function applyRead(r, from, opts) {
+  opts = opts || {};
   S = r.state;
   S.loadedFrom = from;
   dirty = false;
@@ -635,8 +680,34 @@ function applyRead(r, from) {
   if (r.skipped) msg += ' ' + r.skipped + ' unrecognised rows ignored.';
   if (r.clamped) msg += ' ' + r.clamped + ' out-of-range status values clamped.';
   if (r.read !== r.expected) msg += ' Missing rows will be recreated on the next save.';
-  toast(msg);
+  if (!opts.silent) toast(opts.notice || msg);
   setStatus(describeConnection(), 'ok');
+}
+async function syncFromHandle(opts) {
+  opts = opts || {};
+  if (!handle || saveInProgress) return false;
+  try {
+    const f = await handle.getFile();
+    if (!opts.force && lastObservedModified !== null && f.lastModified === lastObservedModified) return false;
+    const discardedDashboardChanges = dirty;
+    if (discardedDashboardChanges) clearTimeout(saveTimer);
+    const r = readWorkbook(XLSX, PLAN, new Uint8Array(await f.arrayBuffer()));
+    lastObservedModified = f.lastModified;
+    applyRead(r, handle.name, {
+      silent: !opts.notice,
+      notice: opts.notice ? (discardedDashboardChanges
+        ? 'Excel changes loaded. Excel took priority over pending dashboard edits.'
+        : 'Excel changes loaded.') : ''
+    });
+    return true;
+  } catch (e) {
+    setStatus('Could not sync workbook: ' + e.message, 'warn');
+    return false;
+  }
+}
+function startWorkbookSync() {
+  clearInterval(syncTimer);
+  syncTimer = setInterval(() => { syncFromHandle({ notice: true }); }, SYNC_INTERVAL_MS);
 }
 async function openWithPicker() {
   try {
@@ -647,7 +718,10 @@ async function openWithPicker() {
     const f = await h.getFile();
     const r = readWorkbook(XLSX, PLAN, new Uint8Array(await f.arrayBuffer()));
     handle = h;
+    lastObservedModified = f.lastModified;
+    try { await rememberHandle(h); } catch (e) { console.warn('Could not remember workbook handle.', e); }
     applyRead(r, h.name);
+    startWorkbookSync();
   } catch (e) {
     if (e && e.name === 'AbortError') return;
     setStatus('Could not open that file: ' + e.message, 'warn');
@@ -682,9 +756,50 @@ async function saveAsNew() {
       suggestedName: FILE,
       types: [{ description: 'Excel workbook', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }]
     });
-    await saveToHandle();
+    try { await rememberHandle(handle); } catch (e) { console.warn('Could not remember workbook handle.', e); }
+    await saveToHandle(true);
+    startWorkbookSync();
     toast('Connected. Changes now write straight into ' + handle.name + '.');
   } catch (e) { if (e && e.name !== 'AbortError') toast(e.message); }
+}
+async function restoreWorkbook() {
+  try {
+    const h = await savedHandle();
+    if (!h) return false;
+    handle = h;
+    const permission = await h.queryPermission({ mode: 'readwrite' });
+    if (permission !== 'granted') {
+      setStatus('Workbook permission needs renewal — click Connect workbook', 'warn');
+      return false;
+    }
+    if (!(await syncFromHandle({ force: true, notice: true }))) return false;
+    startWorkbookSync();
+    return true;
+  } catch (e) {
+    setStatus('Could not restore workbook connection: ' + e.message, 'warn');
+    return false;
+  }
+}
+async function reconnectOrPick() {
+  if (handle) {
+    try {
+      const permission = await handle.queryPermission({ mode: 'readwrite' });
+      if (permission !== 'granted') {
+        const granted = await handle.requestPermission({ mode: 'readwrite' });
+        if (granted !== 'granted') {
+          setStatus('Workbook permission was not granted.', 'warn');
+          return;
+        }
+        if (!(await syncFromHandle({ force: true, notice: true }))) return;
+        startWorkbookSync();
+        return;
+      }
+    } catch (e) {
+      setStatus('Could not reconnect workbook: ' + e.message, 'warn');
+      return;
+    }
+  }
+  if (canFS) openWithPicker(); else openWithInput();
 }
 async function autoLoad() {
   if (location.protocol === 'file:') return false;
@@ -1079,12 +1194,12 @@ function panelGuide() {
     ph.key + ', weeks ' + ph.from + ' to ' + ph.to + ', ' + ph.name + ' — ' + ph.blurb)));
   p.appendChild(el('h4', null, 'How the workbook and this page fit together'));
   p.appendChild(el('p', null,
-    'The workbook is the store. This page holds nothing of its own: close it without saving and the changes are gone. ' +
-    'On Chrome and Edge, connect once with Open workbook and every change writes straight back into the file. ' +
-    'On Safari and Firefox the browser cannot write to a folder, so use Download workbook and replace the file yourself.'));
+    'The workbook is the store. Install this tracker in Chrome or Edge, then connect the workbook once. ' +
+    'The installed app restores the connection, loads the workbook at launch, and writes dashboard changes back automatically.'));
   p.appendChild(el('p', null,
     'You can edit the workbook directly. The State sheet has one row per item; change the status number ' +
-    '(codes are on the Settings sheet), the hours, the solved count or the note, save in Excel, then reload here. ' +
+    '(codes are on the Settings sheet), the hours, the solved count or the note, then save in Excel. ' +
+    'The tracker checks for those changes every five seconds; Excel changes take priority if both places changed. ' +
     'The Dashboard and Plan sheets are generated, so anything you type there is overwritten on the next save.'));
   return p;
 }
@@ -1121,15 +1236,12 @@ function toast(msg) {
 }
 
 function wire() {
-  $('#btnOpen').onclick = () => (canFS ? openWithPicker() : openWithInput());
+  $('#btnOpen').onclick = reconnectOrPick;
   $('#btnSave').onclick = () => (handle ? saveToHandle() : saveAsNew());
   $('#btnDownload').onclick = downloadWorkbook;
   $('#btnReload').onclick = async () => {
-    if (dirty && !confirm('Discard unsaved changes and reload from the workbook?')) return;
-    if (handle) {
-      try { applyRead(readWorkbook(XLSX, PLAN, new Uint8Array(await (await handle.getFile()).arrayBuffer())), handle.name); }
-      catch (e) { toast(e.message); }
-    } else if (!(await autoLoad())) { canFS ? openWithPicker() : openWithInput(); }
+    if (handle) await syncFromHandle({ force: true, notice: true });
+    else reconnectOrPick();
   };
   $('#startInput').onchange = (e) => {
     if (parseISO(e.target.value)) { S.start = e.target.value; markDirty(); render(); }
@@ -1163,13 +1275,19 @@ function wire() {
 async function boot() {
   wire();
   $('#fsNote').textContent = canFS
-    ? 'Click Open workbook, pick ' + FILE + ' from your folder, and every change writes straight back into it.'
-    : 'This browser cannot write to a folder. Open workbook loads your file; Download workbook writes a new copy you replace it with. Chrome or Edge gives you direct saving.';
+    ? 'Install this app in Chrome or Edge, connect ' + FILE + ' once, and changes will sync automatically.'
+    : 'Use Chrome or Edge for automatic Excel synchronization. This browser can only download a backup copy.';
   render();
-  setStatus('No workbook connected — open ' + FILE + ' to load your progress', 'warn');
+  setStatus('Restoring workbook connection…');
+  if (await restoreWorkbook()) return;
+  if (handle) return;
   if (await autoLoad()) return;
+  setStatus('No workbook connected — click Connect workbook to choose ' + FILE, 'warn');
 }
 window.__l5 = () => S;   /* debug hook: inspect current state in the console */
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  window.addEventListener('load', () => navigator.serviceWorker.register('./service-worker.js'));
+}
 boot();
 })();
 
